@@ -196,6 +196,9 @@ class DepthAICamera(Camera):
         try:
             # Create pipeline using DepthAI v3 API
             self.pipeline = dai.Pipeline()
+            # Down-convert to USB2 speed if needed
+            if self.config.usb_speed == "usb2":
+                self.pipeline.setUsbSpeed(dai.UsbSpeed.HIGH)
 
             # Configure RGB camera (CAM_A) if enabled
             if self.enable_rgb:
