@@ -57,7 +57,7 @@ class DepthAICameraConfig(CameraConfig):
     enable_depth: bool = False
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
-    usb_speed: str = "usb3"
+    usb_speed: str = "usb2"
 
     def __post_init__(self):
         # Validate that at least one stream is enabled

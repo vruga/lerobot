@@ -194,47 +194,62 @@ class DepthAICamera(Camera):
             raise DeviceAlreadyConnectedError(f"{self} is already connected.")
 
         try:
-            # Create pipeline using DepthAI v3 API
+            # Create pipeline using DepthAI v2.24 API
             self.pipeline = dai.Pipeline()
-            # Down-convert to USB2 speed if needed
-            if self.config.usb_speed == "usb2":
-                self.pipeline.setUsbSpeed(dai.UsbSpeed.HIGH)
 
             # Configure RGB camera (CAM_A) if enabled
             if self.enable_rgb:
-                cam_rgb = self.pipeline.create(dai.node.Camera).build()
-                # Request output with desired resolution
-                self.q_rgb = cam_rgb.requestOutput((self.width, self.height)).createOutputQueue()
+                cam_rgb = self.pipeline.createColorCamera()
+                cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+                cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.RGB)
+
+                # Create RGB output
+                xout_rgb = self.pipeline.createXLinkOut()
+                xout_rgb.setStreamName("rgb")
+                cam_rgb.preview.link(xout_rgb.input)
 
             # Configure depth cameras (CAM_B and CAM_C) if enabled
             if self.enable_depth:
-                # Create mono cameras using v3 API
-                cam_left = self.pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
-                cam_right = self.pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
+                # Create mono cameras
+                cam_left = self.pipeline.createMonoCamera()
+                cam_right = self.pipeline.createMonoCamera()
+                cam_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
+                cam_left.setBoardSocket(dai.CameraBoardSocket.LEFT)
+                cam_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
+                cam_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
 
                 # Create stereo depth node
-                stereo = self.pipeline.create(dai.node.StereoDepth)
-
-                # Link mono camera outputs to stereo inputs
-                mono_left_out = cam_left.requestFullResolutionOutput(type=dai.ImgFrame.Type.NV12)
-                mono_right_out = cam_right.requestFullResolutionOutput(type=dai.ImgFrame.Type.NV12)
-
-                mono_left_out.link(stereo.left)
-                mono_right_out.link(stereo.right)
-
-                # Configure stereo depth
-                stereo.setRectification(True)
-                stereo.setExtendedDisparity(True)
+                stereo = self.pipeline.createStereoDepth()
+                stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_ACCURACY)
+                stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
                 stereo.setLeftRightCheck(True)
+                stereo.setSubpixel(False)
 
-                # Create depth output queue
-                self.q_depth = stereo.disparity.createOutputQueue()
+                # Link mono cameras to stereo depth
+                cam_left.out.link(stereo.left)
+                cam_right.out.link(stereo.right)
 
-            # Start pipeline
-            self.pipeline.start()
+                # Create depth output
+                xout_depth = self.pipeline.createXLinkOut()
+                xout_depth.setStreamName("depth")
+                stereo.depth.link(xout_depth.input)
 
-            # Store pipeline as device reference for v3 compatibility
-            self.device = self.pipeline
+            # Create device with USB speed configuration
+            device_info = None
+            if self.mxid:
+                device_info = dai.DeviceInfo(self.mxid)
+            
+            # Set USB2 mode if requested
+            usb2_mode = self.config.usb_speed == "usb2"
+            
+            # Connect to device
+            self.device = dai.Device(self.pipeline, device_info, usb2Mode=usb2_mode)
+
+            # Get output queues
+            if self.enable_rgb:
+                self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
+            if self.enable_depth:
+                self.q_depth = self.device.getOutputQueue(name="depth", maxSize=4, blocking=False)
 
         except Exception as e:
             self.device = None
@@ -276,7 +291,7 @@ class DepthAICamera(Camera):
                 camera_info = {
                     "name": getattr(device_info, "name", "Unknown DepthAI Camera"),
                     "type": "DepthAI",
-                    "id": device_info.deviceId,  # Use deviceId instead of getMxId()
+                    "id": device_info.mxid,  # Use mxid as the correct attribute
                     "state": getattr(device_info, "state", "Unknown").name
                     if hasattr(getattr(device_info, "state", None), "name")
                     else str(getattr(device_info, "state", "Unknown")),
@@ -588,9 +603,8 @@ class DepthAICamera(Camera):
             self._stop_read_thread()
 
         if self.device is not None:
-            # In v3 API, pipeline.stop() handles cleanup
-            if hasattr(self.device, "stop"):
-                self.device.stop()
+            # Close the device connection
+            self.device.close()
             self.device = None
             self.pipeline = None
             self.q_rgb = None
