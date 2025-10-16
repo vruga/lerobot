@@ -144,6 +144,18 @@ def train(cfg: TrainPipelineConfig):
     Args:
         cfg: A `TrainPipelineConfig` object containing all training configurations.
     """
+    # changes made here for torch.compile
+    if cfg.training.get("use_compile" , False):
+        import torch._dynamo
+        torch._dynamo.config.verbose = True
+
+        print("Compiling policy using torch.compile ...")
+        policy= torch.compile(
+                policy,
+                mode=cfg.training.get("compile_mode", "default"),
+                fullgraph= False #Allows graph breaks
+        )
+        print("Policy compiled")
     cfg.validate()
     logging.info(pformat(cfg.to_dict()))
 
