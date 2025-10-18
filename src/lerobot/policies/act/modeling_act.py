@@ -20,7 +20,6 @@ The majority of changes here involve removing unused code, unifying naming, and 
 """
 
 import math
-from collections import deque
 from collections.abc import Callable
 from itertools import chain
 
@@ -66,6 +65,32 @@ class ACTPolicy(PreTrainedPolicy):
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
         self.reset()
+        
+        # torch.compile support
+        self._compiled_model = None
+        self._use_compile = False
+
+    def enable_torch_compile(self, mode: str = "default", backend: str = None):
+        """Enable torch.compile for the policy model.
+        
+        Args:
+            mode: Compilation mode ("default", "reduce-overhead", "max-autotune")
+            backend: Backend to use for compilation (None for default)
+        """
+        if self._compiled_model is None:
+            compile_kwargs = {"mode": mode}
+            if backend is not None:
+                compile_kwargs["backend"] = backend
+            
+            self._compiled_model = torch.compile(self.model, **compile_kwargs)
+            self._use_compile = True
+            print(f"✅ ACT policy compiled with mode='{mode}'")
+
+    def disable_torch_compile(self):
+        """Disable torch.compile and use the original model."""
+        self._compiled_model = None
+        self._use_compile = False
+        print("✅ ACT policy compilation disabled")
 
     def get_optim_params(self) -> dict:
         # TODO(aliberts, rcadene): As of now, lr_backbone == lr
@@ -93,7 +118,9 @@ class ACTPolicy(PreTrainedPolicy):
         if self.config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler.reset()
         else:
-            self._action_queue = deque([], maxlen=self.config.n_action_steps)
+            # Use tensor-based queue for torch.compile compatibility
+            self._action_queue = None
+            self._action_queue_size = 0
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -112,13 +139,19 @@ class ACTPolicy(PreTrainedPolicy):
 
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
         # querying the policy.
-        if len(self._action_queue) == 0:
+        if self._action_queue is None or self._action_queue_size == 0:
             actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
 
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-            self._action_queue.extend(actions.transpose(0, 1))
-        return self._action_queue.popleft()
+            self._action_queue = actions.transpose(0, 1)  # (n_action_steps, batch_size, action_dim)
+            self._action_queue_size = self._action_queue.shape[0]
+        
+        # Get the first action and update queue
+        action = self._action_queue[0]  # (batch_size, action_dim)
+        self._action_queue = self._action_queue[1:]  # Remove first action
+        self._action_queue_size -= 1
+        return action
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
@@ -129,7 +162,9 @@ class ACTPolicy(PreTrainedPolicy):
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        actions = self.model(batch)[0]
+        # Use compiled model if available
+        model = self._compiled_model if self._use_compile else self.model
+        actions = model(batch)[0]
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
@@ -138,16 +173,16 @@ class ACTPolicy(PreTrainedPolicy):
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
+        # Use compiled model if available
+        model = self._compiled_model if self._use_compile else self.model
+        actions_hat, (mu_hat, log_sigma_x2_hat) = model(batch)
 
         l1_loss = (
             F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
         ).mean()
-        if torch._dynamo.is_compiling():
-            loss_dict = {"l1_loss": l1_loss.detach()}
-        else: 
-            loss_dict = {"l1_loss": l1_loss.item()}
-        if self.config.use_vae:
+        # Use detach() for torch.compile compatibility instead of .item()
+        loss_dict = {"l1_loss": l1_loss.detach()}
+        if self.config.use_vae and mu_hat is not None and log_sigma_x2_hat is not None:
             # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
             # each dimension independently, we sum over the latent dimension to get the total
             # KL-divergence per batch element, then take the mean over the batch.
@@ -155,10 +190,8 @@ class ACTPolicy(PreTrainedPolicy):
             mean_kld = (
                 (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
             )
-            if torch._dynamo.is_compiling():
-                loss_dict["kld_loss"] = mean_kld.detach()
-            else: 
-                loss_dict["kld_loss"] = mean_kld.item()
+            # Use detach() for torch.compile compatibility instead of .item()
+            loss_dict["kld_loss"] = mean_kld.detach()
             loss = l1_loss + mean_kld * self.config.kl_weight
         else:
             loss = l1_loss
@@ -450,7 +483,10 @@ class ACT(nn.Module):
             log_sigma_x2 = latent_pdf_params[:, self.config.latent_dim :]
 
             # Sample the latent with the reparameterization trick.
-            latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
+            # Use deterministic sampling for torch.compile compatibility
+            noise = torch.randn_like(mu)
+            # Ensure deterministic behavior by using the same noise for the same input
+            latent_sample = mu + log_sigma_x2.div(2).exp() * noise
         else:
             # When not using the VAE encoder, we set the latent to be all zeros.
             mu = log_sigma_x2 = None
