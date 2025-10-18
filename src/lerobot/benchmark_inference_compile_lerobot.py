@@ -98,7 +98,7 @@ class TorchCompileBenchmark:
         self.n_training = 50
         self.batch_size = 8
         self.warmup_steps = 10
-        self.tolerance = 2e-2  # Even more realistic tolerance for transformer models with attention
+        self.tolerance = 1e-5
 
         print(f"🤖 Torch.compile Benchmark for {policy_name.upper()} Policy")
         print(f"Device: {device}")
@@ -111,6 +111,9 @@ class TorchCompileBenchmark:
         torch.manual_seed(42)
         np.random.seed(42)
 
+        # Load dataset metadata
+        ds_meta = LeRobotDatasetMetadata(self.repo_id)
+
         # Get policy configuration safely
         if self.policy_name not in POLICY_CONFIGS:
             available_policies = list(POLICY_CONFIGS.keys())
@@ -121,103 +124,34 @@ class TorchCompileBenchmark:
         # Create policy configuration
         cfg = make_policy_config(self.policy_name, device=str(self.device), **policy_config.config_kwargs)
 
-        # Create policy directly (bypass dataset loading for torch.compile testing)
-        if self.policy_name == "act":
-            from lerobot.policies.act.modeling_act import ACTPolicy
-            from lerobot.policies.act.configuration_act import ACTConfig
-            from lerobot.configs.types import PolicyFeature, FeatureType
-            
-            # Create ACT config with proper features
-            act_cfg = ACTConfig(
-                input_features={
-                    "observation.images.top": PolicyFeature(
-                        shape=(3, 480, 640),
-                        type=FeatureType.VISUAL
-                    ),
-                    "observation.images.wrist": PolicyFeature(
-                        shape=(3, 480, 640), 
-                        type=FeatureType.VISUAL
-                    ),
-                    "observation.state": PolicyFeature(
-                        shape=(6,),
-                        type=FeatureType.STATE
-                    ),
-                    "observation.environment_state": PolicyFeature(
-                        shape=(6,),
-                        type=FeatureType.STATE
-                    )
-                },
-                output_features={
-                    "action": PolicyFeature(
-                        shape=(6,),
-                        type=FeatureType.ACTION
-                    )
-                },
-                chunk_size=cfg.chunk_size,
-                n_action_steps=cfg.n_action_steps,
-                use_vae=cfg.use_vae
-            )
-            policy = ACTPolicy(act_cfg).to(self.device)
-        else:
-            # For other policies, try to create with minimal dataset metadata
-            try:
-                ds_meta = LeRobotDatasetMetadata(self.repo_id)
-                policy = make_policy(cfg, ds_meta=ds_meta)
-                policy.to(self.device)
-            except Exception as e:
-                print(f"⚠️  Dataset loading failed ({e}), using synthetic data for {self.policy_name}")
-                # Fallback: create policy without dataset metadata
-                policy = make_policy(cfg)
-                policy.to(self.device)
+        # Create policy
+        policy = make_policy(cfg, ds_meta=ds_meta)
+        policy.to(self.device)
 
-        # Create synthetic batch data
-        if self.policy_name == "act":
-            sample_batch = {
-                "observation.images.top": torch.randn(
-                    self.batch_size, 3, 480, 640, 
-                    dtype=torch.float32, device=self.device
-                ),
-                "observation.images.wrist": torch.randn(
-                    self.batch_size, 3, 480, 640, 
-                    dtype=torch.float32, device=self.device
-                ),
-                "observation.state": torch.randn(
-                    self.batch_size, 6, 
-                    dtype=torch.float32, device=self.device
-                ),
-                "observation.environment_state": torch.randn(
-                    self.batch_size, 6, 
-                    dtype=torch.float32, device=self.device
-                ),
-                "action": torch.randn(
-                    self.batch_size, cfg.chunk_size, 6, 
-                    dtype=torch.float32, device=self.device
-                ),
-                "action_is_pad": torch.zeros(
-                    self.batch_size, cfg.chunk_size, 
-                    dtype=torch.bool, device=self.device
-                )
-            }
-        else:
-            # For other policies, create minimal synthetic data
-            sample_batch = {
-                "observation.state": torch.randn(self.batch_size, 6, device=self.device),
-                "action": torch.randn(self.batch_size, 6, device=self.device)
-            }
+        # Create processors using the safe function reference
+        preprocessor, postprocessor = policy_config.processor_func(cfg, dataset_stats=ds_meta.stats)
 
-        # Create dummy processors (not used with synthetic data)
-        preprocessor = lambda x: x
-        postprocessor = lambda x: x
+        # Setup dataset with appropriate delta_timestamps
+        delta_timestamps = policy_config.delta_timestamps_func(cfg, ds_meta.fps)
+        dataset = LeRobotDataset(self.repo_id, episodes=[0], delta_timestamps=delta_timestamps)
+        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, drop_last=True)
+
+        # Get sample batch
+        sample_batch = next(iter(dataloader))
+
+        # Move to device
+        for key in sample_batch:
+            if isinstance(sample_batch[key], torch.Tensor):
+                sample_batch[key] = sample_batch[key].to(self.device)
+
+        # Preprocess
+        sample_batch = preprocessor(sample_batch)
 
         return policy, sample_batch, preprocessor, postprocessor
 
     def benchmark_inference(self, policy, batch) -> Tuple[float, torch.Tensor]:
         """Benchmark inference performance"""
         policy.eval()
-        
-        # Set deterministic mode for consistent results
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
 
         # Warmup
         with torch.no_grad():
@@ -249,11 +183,6 @@ class TorchCompileBenchmark:
     def benchmark_training(self, policy, batch) -> Tuple[float, List[float], List[float]]:
         """Benchmark training performance"""
         policy.train()
-        
-        # Set deterministic mode for consistent results
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        
         optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
 
         # Warmup
@@ -517,7 +446,7 @@ class TorchCompileBenchmark:
             torch._dynamo.config.verbose = True
             torch._dynamo.config.suppress_errors = True
 
-            policy_compiled = torch.compile(policy, mode="reduce-overhead")
+            policy_compiled = torch.compile(policy, mode="default")
 
             # Force compilation by running once
             policy_compiled.eval()
