@@ -563,7 +563,7 @@ class VLAFlowMatching(nn.Module):
         # Compile core computation methods
         # These are the hottest paths during inference and training
         self.denoise_step = torch.compile(self.denoise_step, **compile_kwargs)
-        self._denoising_loop = torch.compile(self._denoising_loop, **compile_kwargs)
+        self._denoising_loop_unrolled = torch.compile(self._denoising_loop_unrolled, **compile_kwargs)
         self.embed_suffix = torch.compile(self.embed_suffix, **compile_kwargs)
 
         # Note: embed_prefix has a dynamic loop over images, so we leave it uncompiled
@@ -778,19 +778,19 @@ class VLAFlowMatching(nn.Module):
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
 
-    def _denoising_loop(self, prefix_pad_masks, past_key_values, x_t, dt, bsize, num_steps):
-        """Denoising loop refactored for torch.compile compatibility.
+    def _denoising_loop_unrolled(self, prefix_pad_masks, past_key_values, x_t, dt, bsize, num_steps):
+        """Fully unrolled denoising loop - best for torch.compile.
 
-        Replace while loop with fixed iteration for loop to enable compilation.
+        Unrolls the loop completely to eliminate all dynamic control flow.
         """
-        # Fixed number of iterations - can be compiled
-        # Avoid dt.item() to prevent graph breaks - use tensor operations instead
-        step_indices = torch.arange(num_steps, dtype=torch.float32, device=x_t.device)
+        # Precompute all timesteps
+        step_indices = torch.arange(num_steps, dtype=dt.dtype, device=x_t.device)
+        all_times = 1.0 + step_indices * dt.squeeze()  # [num_steps]
 
+        # Process each step
         for step_idx in range(num_steps):
-            # Compute time for this step using tensor operations (no .item())
-            time_val = 1.0 + step_indices[step_idx] * dt
-            time = time_val.expand(bsize)
+            # Extract single timestep and broadcast to batch
+            time = all_times[step_idx].unsqueeze(0).expand(bsize)
 
             v_t = self.denoise_step(
                 prefix_pad_masks,
@@ -830,7 +830,7 @@ class VLAFlowMatching(nn.Module):
 
         x_t = noise
         # Use fixed iteration loop instead of while loop for torch.compile
-        x_t = self._denoising_loop(prefix_pad_masks, past_key_values, x_t, dt, bsize, self.config.num_steps)
+        x_t = self._denoising_loop_unrolled(prefix_pad_masks, past_key_values, x_t, dt, bsize, self.config.num_steps)
         return x_t
 
     def denoise_step(
