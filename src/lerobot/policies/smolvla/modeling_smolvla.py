@@ -236,11 +236,33 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.model = VLAFlowMatching(config)
         self.reset()
 
+        # Apply torch.compile to policy-level methods if enabled
+        if self.config.use_torch_compile:
+            self._apply_torch_compile_policy()
+
     def reset(self):
         """This should be called whenever the environment is reset."""
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+
+    def _apply_torch_compile_policy(self):
+        """Apply torch.compile to policy-level helper methods."""
+        import torch
+
+        compile_kwargs = {"mode": self.config.compile_mode}
+
+        # Compile the Aloha transformation functions - these are now vectorized
+        if self.config.adapt_to_pi_aloha:
+            self._pi_aloha_decode_state = torch.compile(self._pi_aloha_decode_state, **compile_kwargs)
+            self._pi_aloha_encode_actions = torch.compile(self._pi_aloha_encode_actions, **compile_kwargs)
+            self._pi_aloha_encode_actions_inv = torch.compile(self._pi_aloha_encode_actions_inv, **compile_kwargs)
+
+        # Compile preparation functions
+        self.prepare_state = torch.compile(self.prepare_state, **compile_kwargs)
+        self.prepare_action = torch.compile(self.prepare_action, **compile_kwargs)
+
+        print(f"✅ Applied torch.compile with mode='{self.config.compile_mode}' to SmolVLAPolicy methods")
 
     def get_optim_params(self) -> dict:
         return self.parameters()
@@ -384,30 +406,39 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return images, img_masks
 
     def _pi_aloha_decode_state(self, state):
-        # Flip the joints.
-        for motor_idx in [1, 2, 8, 9]:
-            state[:, motor_idx] *= -1
-        # Reverse the gripper transformation that is being applied by the Aloha runtime.
-        for motor_idx in [6, 13]:
-            state[:, motor_idx] = aloha_gripper_to_angular(state[:, motor_idx])
+        # Vectorized version - flip the joints and transform grippers
+        # Create a copy to avoid in-place modifications during torch.compile
+        state = state.clone()
+        # Flip the joints using advanced indexing
+        flip_indices = torch.tensor([1, 2, 8, 9], device=state.device, dtype=torch.long)
+        state[:, flip_indices] *= -1
+        # Reverse the gripper transformation using vectorized operations
+        gripper_indices = torch.tensor([6, 13], device=state.device, dtype=torch.long)
+        state[:, gripper_indices] = aloha_gripper_to_angular(state[:, gripper_indices])
         return state
 
     def _pi_aloha_encode_actions(self, actions):
-        # Flip the joints.
-        for motor_idx in [1, 2, 8, 9]:
-            actions[:, :, motor_idx] *= -1
-        # Reverse the gripper transformation that is being applied by the Aloha runtime.
-        for motor_idx in [6, 13]:
-            actions[:, :, motor_idx] = aloha_gripper_from_angular(actions[:, :, motor_idx])
+        # Vectorized version - flip the joints and transform grippers
+        # Create a copy to avoid in-place modifications during torch.compile
+        actions = actions.clone()
+        # Flip the joints using advanced indexing
+        flip_indices = torch.tensor([1, 2, 8, 9], device=actions.device, dtype=torch.long)
+        actions[:, :, flip_indices] *= -1
+        # Reverse the gripper transformation using vectorized operations
+        gripper_indices = torch.tensor([6, 13], device=actions.device, dtype=torch.long)
+        actions[:, :, gripper_indices] = aloha_gripper_from_angular(actions[:, :, gripper_indices])
         return actions
 
     def _pi_aloha_encode_actions_inv(self, actions):
-        # Flip the joints again.
-        for motor_idx in [1, 2, 8, 9]:
-            actions[:, :, motor_idx] *= -1
-        # Reverse the gripper transformation that is being applied by the Aloha runtime.
-        for motor_idx in [6, 13]:
-            actions[:, :, motor_idx] = aloha_gripper_from_angular_inv(actions[:, :, motor_idx])
+        # Vectorized version - flip the joints and transform grippers
+        # Create a copy to avoid in-place modifications during torch.compile
+        actions = actions.clone()
+        # Flip the joints using advanced indexing
+        flip_indices = torch.tensor([1, 2, 8, 9], device=actions.device, dtype=torch.long)
+        actions[:, :, flip_indices] *= -1
+        # Reverse the gripper transformation using vectorized operations
+        gripper_indices = torch.tensor([6, 13], device=actions.device, dtype=torch.long)
+        actions[:, :, gripper_indices] = aloha_gripper_from_angular_inv(actions[:, :, gripper_indices])
         return actions
 
     def prepare_state(self, batch):
@@ -511,9 +542,34 @@ class VLAFlowMatching(nn.Module):
         self.image_end_token = torch.tensor([self.fake_image_token], dtype=torch.long)
         self.prefix_length = self.config.prefix_length
 
+        # Apply torch.compile if enabled
+        if self.config.use_torch_compile:
+            self._apply_torch_compile()
+
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
             params.requires_grad = self.config.train_state_proj
+
+    def _apply_torch_compile(self):
+        """Apply torch.compile to key methods for performance optimization.
+
+        Compiles individual methods rather than the entire model to allow
+        partial optimization and better debugging.
+        """
+        import torch
+
+        compile_kwargs = {"mode": self.config.compile_mode}
+
+        # Compile core computation methods
+        # These are the hottest paths during inference and training
+        self.denoise_step = torch.compile(self.denoise_step, **compile_kwargs)
+        self._denoising_loop = torch.compile(self._denoising_loop, **compile_kwargs)
+        self.embed_suffix = torch.compile(self.embed_suffix, **compile_kwargs)
+
+        # Note: embed_prefix has a dynamic loop over images, so we leave it uncompiled
+        # or use dynamo to handle it partially
+
+        print(f"✅ Applied torch.compile with mode='{self.config.compile_mode}' to VLAFlowMatching methods")
 
     def sample_noise(self, shape, device):
         noise = torch.normal(
@@ -531,62 +587,71 @@ class VLAFlowMatching(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time
 
+    def _embed_single_image(self, img, img_mask, embs, pad_masks, num_att_mask_zeros):
+        """Helper function to embed a single image - can be compiled."""
+        if self.add_image_special_tokens:
+            image_start_token = (
+                self.vlm_with_expert.embed_language_tokens(
+                    self.global_image_start_token.to(device=self.vlm_with_expert.vlm.device)
+                )
+                .unsqueeze(0)
+                .expand(img.shape[0], -1, -1)
+            )
+            image_start_mask = torch.ones_like(
+                image_start_token[:, :, 0], dtype=torch.bool, device=image_start_token.device
+            )
+            num_att_mask_zeros += image_start_mask.shape[-1]
+            embs.append(image_start_token)
+            pad_masks.append(image_start_mask)
+
+        img_emb = self.vlm_with_expert.embed_image(img)
+
+        # Normalize image embeddings
+        img_emb_dim = img_emb.shape[-1]
+        img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
+
+        bsize, num_img_embs = img_emb.shape[:2]
+        img_mask = img_mask[:, None].expand(bsize, num_img_embs)
+
+        embs.append(img_emb)
+        pad_masks.append(img_mask)
+
+        num_att_mask_zeros += num_img_embs
+
+        if self.add_image_special_tokens:
+            image_end_token = (
+                self.vlm_with_expert.embed_language_tokens(
+                    self.image_end_token.to(device=self.vlm_with_expert.vlm.device)
+                )
+                .unsqueeze(0)
+                .expand(img.shape[0], -1, -1)
+            )
+            image_end_mask = torch.ones_like(
+                image_end_token[:, :, 0], dtype=torch.bool, device=image_end_token.device
+            )
+            embs.append(image_end_token)
+            pad_masks.append(image_end_mask)
+            num_att_mask_zeros += image_end_mask.shape[1]
+
+        return num_att_mask_zeros
+
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
+
+        Refactored to minimize graph breaks - loop iteration count is known at compile time.
         """
         embs = []
         pad_masks = []
-        att_masks = []
-        for _img_idx, (
-            img,
-            img_mask,
-        ) in enumerate(zip(images, img_masks, strict=False)):
-            if self.add_image_special_tokens:
-                image_start_token = (
-                    self.vlm_with_expert.embed_language_tokens(
-                        self.global_image_start_token.to(device=self.vlm_with_expert.vlm.device)
-                    )
-                    .unsqueeze(0)
-                    .expand(img.shape[0], -1, -1)
-                )
-                image_start_mask = torch.ones_like(
-                    image_start_token[:, :, 0], dtype=torch.bool, device=image_start_token.device
-                )
-                att_masks += [0] * (image_start_mask.shape[-1])
-                embs.append(image_start_token)
-                pad_masks.append(image_start_mask)
+        num_att_mask_zeros = 0
 
-            img_emb = self.vlm_with_expert.embed_image(img)
-            img_emb = img_emb
+        # Process all images - iteration count known at graph capture time
+        for img, img_mask in zip(images, img_masks, strict=False):
+            num_att_mask_zeros = self._embed_single_image(img, img_mask, embs, pad_masks, num_att_mask_zeros)
 
-            # Normalize image embeddings
-            img_emb_dim = img_emb.shape[-1]
-            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
-
-            bsize, num_img_embs = img_emb.shape[:2]
-            img_mask = img_mask[:, None].expand(bsize, num_img_embs)
-
-            embs.append(img_emb)
-            pad_masks.append(img_mask)
-
-            att_masks += [0] * (num_img_embs)
-            if self.add_image_special_tokens:
-                image_end_token = (
-                    self.vlm_with_expert.embed_language_tokens(
-                        self.image_end_token.to(device=self.vlm_with_expert.vlm.device)
-                    )
-                    .unsqueeze(0)
-                    .expand(img.shape[0], -1, -1)
-                )
-                image_end_mask = torch.ones_like(
-                    image_end_token[:, :, 0], dtype=torch.bool, device=image_end_token.device
-                )
-                embs.append(image_end_token)
-                pad_masks.append(image_end_mask)
-                att_masks += [0] * (image_end_mask.shape[1])
+        # Embed language tokens
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
@@ -596,8 +661,9 @@ class VLAFlowMatching(nn.Module):
         pad_masks.append(lang_masks)
 
         num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
+        num_att_mask_zeros += num_lang_embs
 
+        # Embed state
         state_emb = self.state_proj(state)
         state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
         embs.append(state_emb)
@@ -608,13 +674,19 @@ class VLAFlowMatching(nn.Module):
         state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=device)
         pad_masks.append(state_mask)
 
-        # Set attention masks so that image and language inputs do not attend to state or actions
-        att_masks += [1] * (states_seq_len)
+        # Concatenate all embeddings
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+
+        # Build attention mask - [0] * num_att_mask_zeros + [1] * states_seq_len
+        total_seq_len = embs.shape[1]
+        att_masks = torch.cat([
+            torch.zeros(num_att_mask_zeros, dtype=torch.bool, device=device),
+            torch.ones(states_seq_len, dtype=torch.bool, device=device)
+        ])
         att_masks = att_masks[None, :]
 
+        # Pad if needed
         seq_len = pad_masks.shape[1]
         if seq_len < self.prefix_length:
             embs = pad_tensor(embs, self.prefix_length, pad_value=0)
@@ -706,6 +778,27 @@ class VLAFlowMatching(nn.Module):
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
 
+    def _denoising_loop(self, prefix_pad_masks, past_key_values, x_t, dt, bsize, num_steps):
+        """Denoising loop refactored for torch.compile compatibility.
+
+        Replace while loop with fixed iteration for loop to enable compilation.
+        """
+        # Fixed number of iterations - can be compiled
+        for step_idx in range(num_steps):
+            # Compute time for this step
+            time_val = 1.0 + step_idx * dt.item()
+            time = torch.full((bsize,), time_val, dtype=torch.float32, device=x_t.device)
+
+            v_t = self.denoise_step(
+                prefix_pad_masks,
+                past_key_values,
+                x_t,
+                time,
+            )
+            # Euler step
+            x_t = x_t + dt * v_t
+        return x_t
+
     def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = state.shape[0]
@@ -733,18 +826,8 @@ class VLAFlowMatching(nn.Module):
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
         x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
-            )
-            # Euler step
-            x_t += dt * v_t
-            time += dt
+        # Use fixed iteration loop instead of while loop for torch.compile
+        x_t = self._denoising_loop(prefix_pad_masks, past_key_values, x_t, dt, bsize, self.config.num_steps)
         return x_t
 
     def denoise_step(

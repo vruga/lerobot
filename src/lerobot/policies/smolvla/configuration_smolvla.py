@@ -67,6 +67,10 @@ class SmolVLAConfig(PreTrainedConfig):
     # Attention utils
     use_cache: bool = True
 
+    # torch.compile optimization
+    use_torch_compile: bool = False
+    compile_mode: str = "default"  # "default", "reduce-overhead", "max-autotune"
+
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = True
