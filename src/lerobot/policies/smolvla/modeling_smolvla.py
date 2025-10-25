@@ -784,10 +784,13 @@ class VLAFlowMatching(nn.Module):
         Replace while loop with fixed iteration for loop to enable compilation.
         """
         # Fixed number of iterations - can be compiled
+        # Avoid dt.item() to prevent graph breaks - use tensor operations instead
+        step_indices = torch.arange(num_steps, dtype=torch.float32, device=x_t.device)
+
         for step_idx in range(num_steps):
-            # Compute time for this step
-            time_val = 1.0 + step_idx * dt.item()
-            time = torch.full((bsize,), time_val, dtype=torch.float32, device=x_t.device)
+            # Compute time for this step using tensor operations (no .item())
+            time_val = 1.0 + step_indices[step_idx] * dt
+            time = time_val.expand(bsize)
 
             v_t = self.denoise_step(
                 prefix_pad_masks,

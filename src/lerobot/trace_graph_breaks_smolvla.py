@@ -81,13 +81,23 @@ def trace_graph_breaks(policy_name="smolvla", device="cuda", repo_id="AdilZtn/gr
         explanation = dynamo.explain(policy.select_action)(sample_batch)
         print("\n📊 GRAPH BREAK ANALYSIS:")
         print(f"Total graphs: {explanation.graph_count}")
-        print(f"Graph break count: {explanation.break_count}")
-        print(f"\n💥 GRAPH BREAKS:")
-        for i, reason in enumerate(explanation.break_reasons, 1):
-            print(f"\n  {i}. {reason}")
 
-        print(f"\n📈 Graph ops: {explanation.ops_per_graph}")
-        print(f"\n🔧 Out guards: {explanation.out_guards}")
+        # PyTorch 2.7+ doesn't have break_count, calculate from graph_count
+        break_count = explanation.graph_count - 1 if explanation.graph_count > 0 else 0
+        print(f"Graph break count: {break_count}")
+
+        if hasattr(explanation, 'break_reasons') and explanation.break_reasons:
+            print(f"\n💥 GRAPH BREAKS:")
+            for i, reason in enumerate(explanation.break_reasons, 1):
+                print(f"\n  {i}. {reason}")
+        else:
+            print(f"\n💥 GRAPH BREAKS: {break_count} breaks detected (check warnings above for details)")
+
+        if hasattr(explanation, 'ops_per_graph'):
+            print(f"\n📈 Graph ops: {explanation.ops_per_graph}")
+
+        if hasattr(explanation, 'out_guards'):
+            print(f"\n🔧 Out guards: {explanation.out_guards}")
 
         # Print the full output
         print("\n" + "=" * 80)
@@ -114,13 +124,22 @@ def trace_graph_breaks(policy_name="smolvla", device="cuda", repo_id="AdilZtn/gr
         explanation = dynamo.explain(policy.forward)(sample_batch)
         print("\n📊 GRAPH BREAK ANALYSIS:")
         print(f"Total graphs: {explanation.graph_count}")
-        print(f"Graph break count: {explanation.break_count}")
-        print(f"\n💥 GRAPH BREAKS:")
-        for i, reason in enumerate(explanation.break_reasons, 1):
-            print(f"\n  {i}. {reason}")
 
-        print(f"\n📈 Graph ops: {explanation.ops_per_graph}")
-        print(f"\n🔧 Out guards: {explanation.out_guards}")
+        break_count = explanation.graph_count - 1 if explanation.graph_count > 0 else 0
+        print(f"Graph break count: {break_count}")
+
+        if hasattr(explanation, 'break_reasons') and explanation.break_reasons:
+            print(f"\n💥 GRAPH BREAKS:")
+            for i, reason in enumerate(explanation.break_reasons, 1):
+                print(f"\n  {i}. {reason}")
+        else:
+            print(f"\n💥 GRAPH BREAKS: {break_count} breaks detected (check warnings above for details)")
+
+        if hasattr(explanation, 'ops_per_graph'):
+            print(f"\n📈 Graph ops: {explanation.ops_per_graph}")
+
+        if hasattr(explanation, 'out_guards'):
+            print(f"\n🔧 Out guards: {explanation.out_guards}")
 
         # Print the full output
         print("\n" + "=" * 80)
@@ -137,13 +156,16 @@ def trace_graph_breaks(policy_name="smolvla", device="cuda", repo_id="AdilZtn/gr
     print("TRACING CORE MODEL (model.sample_actions)")
     print("=" * 80)
 
-    # Reset dynamo
+    # Reset dynamo and clear CUDA cache to avoid OOM
     dynamo.reset()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     policy.eval()
 
     # Prepare inputs for model.sample_actions
     print("\n🔬 Analyzing model.sample_actions method...")
+    print("⚠️  Warning: This may require significant GPU memory")
     try:
         # Get the inputs
         images, img_masks = policy.prepare_images(sample_batch)
@@ -157,13 +179,22 @@ def trace_graph_breaks(policy_name="smolvla", device="cuda", repo_id="AdilZtn/gr
         )
         print("\n📊 GRAPH BREAK ANALYSIS:")
         print(f"Total graphs: {explanation.graph_count}")
-        print(f"Graph break count: {explanation.break_count}")
-        print(f"\n💥 GRAPH BREAKS:")
-        for i, reason in enumerate(explanation.break_reasons, 1):
-            print(f"\n  {i}. {reason}")
 
-        print(f"\n📈 Graph ops: {explanation.ops_per_graph}")
-        print(f"\n🔧 Out guards: {explanation.out_guards}")
+        break_count = explanation.graph_count - 1 if explanation.graph_count > 0 else 0
+        print(f"Graph break count: {break_count}")
+
+        if hasattr(explanation, 'break_reasons') and explanation.break_reasons:
+            print(f"\n💥 GRAPH BREAKS:")
+            for i, reason in enumerate(explanation.break_reasons, 1):
+                print(f"\n  {i}. {reason}")
+        else:
+            print(f"\n💥 GRAPH BREAKS: {break_count} breaks detected (check warnings above for details)")
+
+        if hasattr(explanation, 'ops_per_graph'):
+            print(f"\n📈 Graph ops: {explanation.ops_per_graph}")
+
+        if hasattr(explanation, 'out_guards'):
+            print(f"\n🔧 Out guards: {explanation.out_guards}")
 
         # Print the full output
         print("\n" + "=" * 80)
@@ -180,8 +211,10 @@ def trace_graph_breaks(policy_name="smolvla", device="cuda", repo_id="AdilZtn/gr
     print("TRACING VLM FORWARD")
     print("=" * 80)
 
-    # Reset dynamo
+    # Reset dynamo and clear CUDA cache
     dynamo.reset()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     print("\n🔬 Analyzing model.forward method...")
     try:
@@ -198,13 +231,22 @@ def trace_graph_breaks(policy_name="smolvla", device="cuda", repo_id="AdilZtn/gr
         )
         print("\n📊 GRAPH BREAK ANALYSIS:")
         print(f"Total graphs: {explanation.graph_count}")
-        print(f"Graph break count: {explanation.break_count}")
-        print(f"\n💥 GRAPH BREAKS:")
-        for i, reason in enumerate(explanation.break_reasons, 1):
-            print(f"\n  {i}. {reason}")
 
-        print(f"\n📈 Graph ops: {explanation.ops_per_graph}")
-        print(f"\n🔧 Out guards: {explanation.out_guards}")
+        break_count = explanation.graph_count - 1 if explanation.graph_count > 0 else 0
+        print(f"Graph break count: {break_count}")
+
+        if hasattr(explanation, 'break_reasons') and explanation.break_reasons:
+            print(f"\n💥 GRAPH BREAKS:")
+            for i, reason in enumerate(explanation.break_reasons, 1):
+                print(f"\n  {i}. {reason}")
+        else:
+            print(f"\n💥 GRAPH BREAKS: {break_count} breaks detected (check warnings above for details)")
+
+        if hasattr(explanation, 'ops_per_graph'):
+            print(f"\n📈 Graph ops: {explanation.ops_per_graph}")
+
+        if hasattr(explanation, 'out_guards'):
+            print(f"\n🔧 Out guards: {explanation.out_guards}")
 
         # Print the full output
         print("\n" + "=" * 80)
