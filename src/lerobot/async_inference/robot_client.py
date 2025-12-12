@@ -219,6 +219,24 @@ class RobotClient:
             self.queue_monitor_thread = threading.Thread(target=self.monitor_queue_level, daemon=True)
             self.queue_monitor_thread.start()
             self.logger.debug("Started queue monitor thread")
+            
+            # CRITICAL FIX: Send bootstrap observation to break the deadlock
+            # This primes the system by ensuring the server has an initial observation
+            self.logger.info("Sending bootstrap observation to initialize protocol")
+            try:
+                bootstrap_obs = TimedObservation(
+                    timestamp=time.time(),
+                    observation=self.robot.get_observation(),
+                    timestep=0,
+                    must_go=True  # Force processing
+                )
+                bootstrap_obs.observation["task"] = ""  # Add empty task
+                if self.send_observation(bootstrap_obs):
+                    self.logger.info("Bootstrap observation sent successfully")
+                else:
+                    self.logger.warning("Failed to send bootstrap observation")
+            except Exception as e:
+                self.logger.warning(f"Bootstrap observation failed: {e}")
 
             return True
 
