@@ -271,18 +271,20 @@ def setup_test_system(monkeypatch, policy_class=None, robot_modifier=None, monit
     )
     
     client = RobotClient(client_config)
+    
     # Replace the robot instance with the modified one if applicable
     if robot_modifier is not None:
         client.robot = mock_robot
-    else:
-        # Ensure robot is connected
-        if not client.robot.is_connected:
-            client.robot.connect()
+    
+    # Always ensure robot is connected
+    if not client.robot.is_connected:
+        client.robot.connect()
     
     # Apply monitor hooks if provided
     if monitor is not None:
-        # Hook into action execution
-        original_send_action = mock_robot.send_action
+        # Hook into action execution - use client.robot to get the actual robot instance
+        actual_robot = client.robot
+        original_send_action = actual_robot.send_action
         
         def monitored_send_action(action_dict):
             # Extract timestep from action values if encoded there
@@ -293,7 +295,7 @@ def setup_test_system(monkeypatch, policy_class=None, robot_modifier=None, monit
             monitor.track_execution(action_dict)
             return original_send_action(action_dict)
         
-        monkeypatch.setattr(mock_robot, "send_action", monitored_send_action)
+        monkeypatch.setattr(actual_robot, "send_action", monitored_send_action)
         
         # Hook into chunk reception
         original_aggregate = client._aggregate_action_queues
