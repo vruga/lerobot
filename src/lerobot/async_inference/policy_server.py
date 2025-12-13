@@ -271,33 +271,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """Check if the observation is valid to be processed by the policy"""
         with self._predicted_timesteps_lock:
             predicted_timesteps = self._predicted_timesteps
-            
-        # Clear old predicted timesteps (sliding window)
-        current_timestep = obs.get_timestep()
-        if len(predicted_timesteps) > 0:
-            # Keep only recent predictions (within actions_per_chunk window)
-            min_keep_timestep = current_timestep - self.actions_per_chunk
-            old_timesteps = {ts for ts in predicted_timesteps if ts < min_keep_timestep}
-            if old_timesteps:
-                with self._predicted_timesteps_lock:
-                    self._predicted_timesteps -= old_timesteps
-                    self.logger.debug(f"Cleared {len(old_timesteps)} old predicted timesteps")
 
-        # Always allow if must_go is set (handled by caller, but double-check)
-        if obs.must_go:
-            self.logger.debug(f"Processing observation #{obs.get_timestep()} - must_go is set")
-            return True
-
-        # Check if we've already predicted for this timestep recently
         if obs.get_timestep() in predicted_timesteps:
-            # But allow re-prediction if enough time has passed
-            if previous_obs and obs.get_timestep() > previous_obs.get_timestep() + self.actions_per_chunk // 2:
-                self.logger.debug(f"Re-processing observation #{obs.get_timestep()} - enough time has passed")
-                return True
             self.logger.debug(f"Skipping observation #{obs.get_timestep()} - Timestep predicted already!")
             return False
 
-        # Check similarity only if we don't have must_go
         elif observations_similar(obs, previous_obs, lerobot_features=self.lerobot_features):
             self.logger.debug(
                 f"Skipping observation #{obs.get_timestep()} - Observation too similar to last obs predicted!"
@@ -311,14 +289,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """Enqueue an observation if it must go through processing, otherwise skip it.
         Observations not in queue are never run through the policy network"""
 
-        # Always enqueue if must_go is set
-        if obs.must_go:
-            self.logger.debug(f"Enqueuing observation #{obs.get_timestep()} - must_go is TRUE")
-            # Clear the timestep from predicted set to allow re-prediction
-            with self._predicted_timesteps_lock:
-                self._predicted_timesteps.discard(obs.get_timestep())
-        
-        # Check other conditions
         if (
             obs.must_go
             or self.last_processed_obs is None
