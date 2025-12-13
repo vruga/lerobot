@@ -18,14 +18,18 @@ A SortedDict keyed on logical timestamp would probably be a better data structur
 ## Client
 - async_client - Main entry point for the robot client
 - client.start() - Calls/Sends Ready and SendPolicyInstructions to the policy server
-    - Starts monitor_queue_level in another background thread.
-    - monitor_queue_level acquires action_queue_lock when reading from action_queue
     - self.must_go.set() is conditionally set. Is defined as `self.must_go = threading.Event()` in the construct, is thread safe and is not set in context of lock.
 - run client.receive_actions in a background thread. Has barrier(2).wait(). Waiting for this thread and the main thread
 - start the control loop in the main thread. Has barrier(2).wait(). Waiting for this thread (main) and the receive_actions background thread
 - control_loop starts loop with while self.running is True.
     - control_loop_action is called if actions_available() is True. Reads action from queue, converts to action dict, sends to robot, updates latest_action.
 - get_observation from the robot, send_observation to the policy server. Acquires action_queue_lock when reading from action_queue. Calls send_observation which in turn calls self.stub.SendObservations(observation_iterator)
+
+
+## Alternative Client Implemetation (Lock Free)
+- background thread: recieve action writes calls GetAction and writes using `put` to _incoming_action_chunks queue. It is the only thread that is allowed to write to this queue, main thread is not allowed to write to this queue.
+- main thread: control loop calls `get` on _incoming_action_chunks queue to get the next action chunk and then merges it into the action schedule which is a SortedDict by logical timestamp.
+- must_go is now always on the main thread so does not need to be theading.Event
 
 
 ## Resources
