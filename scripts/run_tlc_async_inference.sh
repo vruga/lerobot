@@ -9,6 +9,7 @@ set -euo pipefail
 # Available configs:
 #   default          - Standard spec with atomic delivery (default)
 #   network-failures - Test safety properties under network failures
+#   network-delay    - Test under delay/reorder with bounded in-flight messages
 #   aggregation      - Test with abstract aggregation (expensive!)
 #
 # Examples:
@@ -52,13 +53,16 @@ case "${CONFIG_NAME}" in
   network-failures|network_failures|failures)
     CFG_FILE="${SPEC_DIR}/${SPEC_PREFIX}_NetworkFailures.cfg"
     ;;
+  network-delay|network_delay|delay)
+    CFG_FILE="${SPEC_DIR}/${SPEC_PREFIX}_NetworkDelay.cfg"
+    ;;
   aggregation|agg)
     CFG_FILE="${SPEC_DIR}/${SPEC_PREFIX}_Aggregation.cfg"
     echo "WARNING: Aggregation config uses non-determinism and is expensive!"
     ;;
   *)
     echo "error: unknown config '${CONFIG_NAME}'" >&2
-    echo "Available: default, network-failures, aggregation" >&2
+    echo "Available: default, network-failures, network-delay, aggregation" >&2
     exit 1
     ;;
 esac

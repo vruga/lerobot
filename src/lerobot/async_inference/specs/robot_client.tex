@@ -1,0 +1,193 @@
+\documentclass[tikz,border=6pt]{standalone}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{xcolor}
+\usepackage{amssymb} % \checkmark
+
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,calc,decorations.pathreplacing,positioning}
+
+% NOTE:
+% This is a standalone figure intended to mirror the style of the legacy
+% RobotClient diagram, but reflect the architecture in:
+%   src/lerobot/async_inference/robot_client_alternative.py
+
+\begin{document}
+\begin{tikzpicture}[
+  font=\small,
+  laneLine/.style={line width=0.5pt},
+  axisArrow/.style={-{Stealth[length=2.0mm]}, line width=0.6pt},
+  popArrow/.style={-{Stealth[length=1.8mm]}, line width=0.5pt},
+  chunkBox/.style={draw=black, line width=0.6pt, rounded corners=2pt, fill=white},
+  overlapFill/.style={fill=blue!14, draw=none, opacity=0.60},
+  labelText/.style={align=left},
+  braceLabel/.style={midway, fill=white, inner sep=1pt},
+]
+
+% ----------------------------
+% Layout constants
+% ----------------------------
+\def\xRecv{0.0}
+\def\xCtrl{3.8}
+\def\xAxisStart{6.4}
+\def\xAxisEnd{16.6}
+
+\def\yTop{0.0}
+\def\yBottom{-11.4}
+
+% Chunk geometry
+\def\slotW{0.55}
+\def\slotH{0.55}
+
+% ----------------------------
+% Title
+% ----------------------------
+\node[font=\large] at ($(0,0)+(8.3,0.75)$) {RobotClientAlternative};
+
+% ----------------------------
+% Swimlanes (left)
+% ----------------------------
+\draw[laneLine] (\xRecv,\yTop) -- (\xRecv,\yBottom);
+\draw[laneLine] (\xCtrl,\yTop) -- (\xCtrl,\yBottom);
+
+\node[font=\normalsize] at (\xRecv,0.25) {Action receiving};
+\node[font=\normalsize] at (\xRecv,-0.15) {thread};
+\node[font=\normalsize] at (\xCtrl,0.25) {Control loop};
+\node[font=\normalsize] at (\xCtrl,-0.15) {thread};
+
+\node at (\xRecv,\yBottom-0.55) {Timestamp, $t$};
+\node at (\xCtrl,\yBottom-0.55) {Timestamp, $t$};
+
+% ----------------------------
+% Timeline annotations (left)
+% ----------------------------
+% Receiver events
+\node[labelText, anchor=west] at (\xRecv+0.25,-1.4) {First action chunk received\\(enqueued into incoming queue)};
+\node[labelText, anchor=west] at (\xRecv+0.25,-7.2) {New action chunk received\\(enqueued into incoming queue)};
+
+% Control-loop events (key differences vs legacy)
+\node[labelText, anchor=west] at (\xCtrl+0.25,-1.0) {Drain incoming chunks};
+\node[labelText, anchor=west] at (\xCtrl+0.25,-1.9) {Action performed};
+\node[labelText, anchor=west] at (\xCtrl+0.25,-2.8) {Observation not sent};
+\node[labelText, anchor=west] at (\xCtrl+0.25,-3.8) {Action performed};
+\node[labelText, anchor=west] at (\xCtrl+0.25,-4.7) {Observation sent};
+\node[labelText, anchor=west] at (\xCtrl+0.25,-5.7) {Action performed};
+\node[labelText, anchor=west] at (\xCtrl+0.25,-6.6) {Observation sent};
+
+\node[labelText, anchor=west] at (\xCtrl+0.25,-7.9) {Drain incoming chunks};
+\node[labelText, anchor=west] at (\xCtrl+0.25,-8.8) {Action performed};
+\node[labelText, anchor=west] at (\xCtrl+0.25,-9.7) {Observation not sent};
+
+% Markers (sent/not-sent)
+\newcommand{\MarkX}[2]{\node at (#1,#2) {\textcolor{red}{\Large $\times$}};}
+\newcommand{\MarkOK}[2]{\node at (#1,#2) {\textcolor{green!60!black}{\Large \checkmark}};}
+\MarkX{\xCtrl+2.9}{-2.8}
+\MarkOK{\xCtrl+2.9}{-4.7}
+\MarkOK{\xCtrl+2.9}{-6.6}
+\MarkX{\xCtrl+2.9}{-9.7}
+
+% ----------------------------
+% Right side: timestep axis
+% ----------------------------
+\draw[axisArrow] (\xAxisStart, -0.6) -- (\xAxisEnd, -0.6);
+\node[anchor=west] at (\xAxisEnd+0.2,-0.6) {Timestep, $k$};
+
+% Braces above axis (match legacy)
+\draw[decorate,decoration={brace,amplitude=4pt}] (7.0,0.05) -- (10.4,0.05)
+  node[braceLabel, yshift=6pt] {Chunk consumption steps};
+\draw[decorate,decoration={brace,amplitude=4pt}] (10.6,0.05) -- (12.9,0.05)
+  node[braceLabel, yshift=6pt] {Steps consumed during inference};
+
+% Small tick marks inside the brace ranges
+\foreach \x in {7.15,7.55,7.95,8.35,8.75,9.15,9.55,9.95,10.35} {
+  \draw[line width=0.5pt] (\x,-0.42) -- (\x,-0.78);
+}
+\foreach \x in {10.75,11.15,11.55,11.95,12.35,12.75} {
+  \draw[line width=0.5pt] (\x,-0.42) -- (\x,-0.78);
+}
+\node[font=\scriptsize] at (7.12,-0.25) {$0_0$};
+\node[font=\scriptsize] at (8.85,-0.25) {$\cdots$};
+\node[font=\scriptsize] at (10.32,-0.25) {$0_k$};
+
+% ----------------------------
+% Helpers (macros)
+% ----------------------------
+% Draw a segmented rounded rectangle chunk at (x,y) with n slots.
+\newcommand{\Chunk}[4]{%
+  % #1 label (text), #2 x, #3 y, #4 n slots
+  \pgfmathsetmacro{\w}{#4*\slotW}%
+  \draw[chunkBox] (#2,#3) rectangle ++(\w,\slotH);
+  \foreach \i in {1,...,#4} {%
+    \draw[line width=0.45pt] (#2+\i*\slotW,#3) -- (#2+\i*\slotW,#3+\slotH);
+  }%
+  \node[anchor=west] at (#2+\w+0.25,#3+0.5*\slotH) {#1};
+}
+
+% Put a centered \cdots inside a chunk for readability (like the legacy figure).
+\newcommand{\ChunkDots}[3]{%
+  % #1 x, #2 y, #3 n slots
+  \pgfmathsetmacro{\w}{#3*\slotW}%
+  \node at (#1+0.5*\w,#2+0.5*\slotH) {$\cdots$};
+}
+
+% Fill an overlap region (light blue) across slot indices [i0, i1) in a chunk.
+\newcommand{\Overlap}[5]{%
+  % #1 x, #2 y, #3 i0 (0-based), #4 i1 (0-based), #5 height (defaults to \slotH)
+  % NOTE: pgfmath macros must be valid TeX control sequences (letters only).
+  \pgfmathsetmacro{\xZero}{#1 + #3*\slotW}%
+  \pgfmathsetmacro{\xOne}{#1 + #4*\slotW}%
+  \path[overlapFill] (\xZero,#2) rectangle (\xOne,#2+#5);
+}
+
+\newcommand{\Pop}[2]{%
+  \node[anchor=south] at (#1,#2) {\scriptsize pops};
+  \draw[popArrow] (#1,#2-0.05) -- (#1,#2-0.55);
+}
+
+% ----------------------------
+% Main frames (right): schedule/chunks and merge
+% ----------------------------
+% Frame 1: First chunk arrives and is merged into the schedule (conceptual).
+\Chunk{$A_0$, first incoming action chunk}{7.1}{-1.95}{9}
+\ChunkDots{7.1}{-1.95}{9}
+\Pop{7.2}{-2.25}
+
+% Show consumption by shifting the schedule (conceptual).
+\Chunk{}{7.55}{-3.05}{9}
+\ChunkDots{7.55}{-3.05}{9}
+\Pop{7.65}{-3.35}
+
+% During inference, some steps consumed (longer horizontal spacing to mimic legacy).
+\Chunk{}{11.2}{-4.55}{7}
+\ChunkDots{11.2}{-4.55}{7}
+\Pop{11.25}{-4.85}
+
+% Frame 2: Overlap/merge illustration.
+% Incoming chunk A_t overlaps with remaining scheduled actions.
+\Chunk{$A_t$, incoming action chunk}{11.0}{-6.55}{8}
+\Chunk{$A_0$, current schedule}{11.8}{-7.45}{8}
+\ChunkDots{11.0}{-6.55}{8}
+\ChunkDots{11.8}{-7.45}{8}
+
+% Overlap region (light blue), showing aggregated timesteps.
+\Overlap{11.0}{-6.55}{2}{6}{\slotH}
+\Overlap{11.8}{-7.45}{0}{4}{\slotH}
+
+\node[labelText] at (13.1,-8.5) {Overlapping action timesteps are aggregated\\(aggregated actions in light blue)};
+
+% Frame 3: Post-merge schedule (aggregated region visible).
+\Chunk{}{12.2}{-9.75}{9}
+\ChunkDots{12.2}{-9.75}{9}
+\Overlap{12.2}{-9.75}{1}{7}{\slotH}
+\Pop{12.25}{-10.05}
+\node[font=\scriptsize, anchor=west] at (12.2,-10.45) {Action schedule (ordered by timestep)};
+
+% ----------------------------
+% Small callout: must_go triggers only when schedule is empty
+% ----------------------------
+\node[labelText, anchor=west] at (7.1,-10.95) {\scriptsize must\_go is set only when schedule is empty\\[-1pt]\scriptsize (armed when draining any new chunk)};
+
+\end{tikzpicture}
+\end{document}
+

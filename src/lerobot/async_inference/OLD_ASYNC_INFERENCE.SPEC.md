@@ -15,6 +15,32 @@ Notes:
 
 ---
 
+## Minimal stall scenario to target in TLA+ (no actions ever executed)
+
+This is the smallest, code-faithful scenario that can lead to a “client polls forever but never executes an action”, without requiring exotic concurrency.
+
+### Preconditions
+
+- `ActionsPerChunk = 1` (or equivalently, the server returns chunks of length 1).
+- The client constructs observations with `TimedObservation.timestep = max(latest_action_timestep, 0)` (as implemented).
+- The client drops any received action with `timestep <= latest_action_timestep` in `_aggregate_action_queues` (as implemented).
+
+### Trace (informal)
+
+1. Initially `latest_action_timestep = -1`, `must_go_event = TRUE`, and the client’s `action_queue` is empty.
+2. The control loop sends an observation with `timestep = 0` and `must_go = TRUE`, then clears `must_go_event`.
+3. The server processes that observation and returns an action chunk of length 1 with only timestep `0`.
+4. The receiver merges the chunk:
+   - The chunk’s only action is for timestep `0`, but the client’s observation timestep is computed from `latest_action_timestep`, and the protocol expects the action at the current timestep to be “already committed”.
+   - Therefore, the only returned action is not useful for advancing execution (the client needs an action at timestep `> latest_action_timestep` to make progress).
+5. The `action_queue` remains empty (no future actions), so the client never executes an action and `latest_action_timestep` never increases.
+
+### Implication / design requirement
+
+To guarantee progress, the protocol effectively relies on an assumption: **the server must return at least one “future” action** (i.e., an action with timestep strictly greater than the client’s current `latest_action_timestep`). Practically, this means requiring `ActionsPerChunk >= 2` (or an equivalent offsetting convention for timesteps).
+
+---
+
 ## Architectural Overview
 
 ### Key Difference: Single Shared Queue

@@ -32,6 +32,8 @@ CONSTANTS
   ScheduleMaxFactor,
   ChunkSizeThresholdNum,
   ChunkSizeThresholdDen,
+  \* Max number of observations that can be in-flight client->server
+  MaxInFlightObs,
   \* Network failure modeling: when TRUE, messages can be dropped
   EnableNetworkFailures,
   \* Server timeout modeling: when TRUE, server can timeout waiting for obs
@@ -58,6 +60,25 @@ SeqOfLen(S, n) == IF n = 0 THEN {<< >>} ELSE [1..n -> S]
 SeqUpTo(S, n) == UNION { SeqOfLen(S, m) : m \in 0..n }
 
 ActionChunk == SeqUpTo(TimedAction, ActionsPerChunk)
+
+(***************************************************************************
+Server->client unary RPC response for GetActions.
+Empty responses model the server timing out waiting for an observation.
+***************************************************************************)
+ActionResponse ==
+  [isEmpty: BOOLEAN, chunk: ActionChunk]
+
+IsValidResponse(r) ==
+  /\ r \in ActionResponse
+  /\ (r.isEmpty => Len(r.chunk) = 0)
+  /\ (~r.isEmpty => Len(r.chunk) > 0)
+
+(***************************************************************************
+Bounded in-flight observation set (models delay/reorder).
+We use a SET abstraction (not a sequence) to keep operations simple; ordering
+effects are modeled by nondeterministic choice of which message is delivered.
+***************************************************************************)
+ObsInFlight == { S \in SUBSET TimedObservation : Cardinality(S) <= MaxInFlightObs }
 
 (***************************************************************************
 Queue helpers
@@ -155,6 +176,14 @@ VARIABLES
   action_queue,
   action_chunk_size,
   must_go_event,             \* threading.Event: TRUE = set, FALSE = cleared
+  \* In-flight observations (client->server). Models network delay/reorder.
+  obs_inflight,
+  \* Models the unary GetActions RPC call/response:
+  \* - Client continuously polls GetActions in receive_actions
+  \* - Server responds either with Empty (timeout) or a chunk (success)
+  getactions_waiting,
+  action_response_inflight,
+  did_send_obs,
   did_execute,
   did_produce,
   obs_slot,
@@ -166,6 +195,10 @@ vars == <<
   action_queue,
   action_chunk_size,
   must_go_event,
+  obs_inflight,
+  getactions_waiting,
+  action_response_inflight,
+  did_send_obs,
   did_execute,
   did_produce,
   obs_slot,
@@ -181,6 +214,10 @@ Init ==
   /\ action_queue = [t \in Timestep |-> NoAction]
   /\ action_chunk_size = ActionsPerChunk
   /\ must_go_event = TRUE    \* must_go.set() in __init__
+  /\ obs_inflight = {}
+  /\ getactions_waiting = FALSE
+  /\ action_response_inflight = None
+  /\ did_send_obs = FALSE
   /\ did_execute = FALSE
   /\ did_produce = FALSE
   /\ obs_slot = None
@@ -195,6 +232,10 @@ TypeOK ==
   /\ action_queue \in [Timestep -> Actions \cup {NoAction}]
   /\ action_chunk_size \in 1..ActionsPerChunk
   /\ must_go_event \in BOOLEAN
+  /\ obs_inflight \in ObsInFlight
+  /\ getactions_waiting \in BOOLEAN
+  /\ action_response_inflight = None \/ IsValidResponse(action_response_inflight)
+  /\ did_send_obs \in BOOLEAN
   /\ did_execute \in BOOLEAN
   /\ did_produce \in BOOLEAN
   /\ obs_slot = None \/ obs_slot \in TimedObservation
@@ -206,75 +247,64 @@ Client actions
 ***************************************************************************)
 
 (***************************************************************************
-C1_ReceiveAndMergeChunk: Receiver thread gets chunk and atomically merges.
+C0_PollGetActions: Receiver thread initiates a unary GetActions RPC call.
 
-In the old implementation, the receiver thread (_aggregate_action_queues):
-1. Calls GetActions() to receive a chunk
-2. Creates a new Queue (future_action_queue)
-3. Under action_queue_lock, reads current queue's internal deque
-4. For EACH action in chunk:
-   - Under latest_action_lock, reads latest_action to filter stale actions
-   - Aggregates with existing action at same timestep (if any)
-5. Under action_queue_lock, atomically swaps action_queue with new queue
-6. Calls must_go.set() to re-arm
+In the Python code, receive_actions continuously calls GetActions() and blocks
+until a response arrives (Actions or Empty on timeout).
 
-Lock note: The implementation reads latest_action under lock FOR EACH action
-in the chunk. Between iterations, the control loop could update latest_action.
-This TLA+ model abstracts this by reading latest_action_timestep once at the
-start of the merge, which is sound for safety (any action stale at merge-end
-is correctly filtered).
-
-This models the atomic merge-and-swap as a single step.
-Network failures can drop the chunk (when enabled).
+We model the "call is in progress" with getactions_waiting=TRUE.
 ***************************************************************************)
-C1_ReceiveAndMergeChunk ==
-  \E chunk \in ActionChunk :
-    /\ did_execute' = FALSE
-    /\ did_produce' = FALSE
-    /\ IF Len(chunk) = 0
-         THEN
-           /\ UNCHANGED << action_queue, action_chunk_size, must_go_event >>
-         ELSE IF MaxChunkTimestep(chunk) <= latest_action_timestep
-           THEN
-             \* Fully stale chunk, no change
-             /\ UNCHANGED << action_queue, action_chunk_size, must_go_event >>
-           ELSE
-             LET new_chunk_size == MaxInt(action_chunk_size, Len(chunk)) IN
-             LET merged == MergeChunk(action_queue, chunk, latest_action_timestep) IN
-             LET k == ScheduleMaxFactor * new_chunk_size IN
-             LET trimmed == TrimQueue(merged, latest_action_timestep, k) IN
-             /\ action_chunk_size' = new_chunk_size
-             /\ action_queue' = trimmed
-             /\ must_go_event' = TRUE  \* must_go.set() after receiving actions
-             /\ Assert(\A t \in Timestep : t <= latest_action_timestep => trimmed[t] = NoAction,
-                       "C1 produced queue with past timesteps")
-    /\ UNCHANGED <<latest_action_timestep, obs_slot, last_processed_obs, predicted_obs_timesteps>>
+C0_PollGetActions ==
+  /\ ~getactions_waiting
+  /\ getactions_waiting' = TRUE
+  /\ did_send_obs' = FALSE
+  /\ did_execute' = FALSE
+  /\ did_produce' = FALSE
+  /\ UNCHANGED <<
+      latest_action_timestep,
+      action_queue,
+      action_chunk_size,
+      must_go_event,
+      obs_inflight,
+      action_response_inflight,
+      obs_slot,
+      last_processed_obs,
+      predicted_obs_timesteps
+    >>
 
 (***************************************************************************
-C1_ReceiveWithAggregation: Variant that uses abstract aggregation.
-WARNING: This is significantly more expensive for TLC due to non-determinism.
+C1_DeliverGetActionsResponse: The in-flight GetActions response arrives at client.
+
+This is where the receiver thread merges a non-empty chunk into the local queue,
+and (crucially) only sets must_go_event when it receives a non-empty chunk.
 ***************************************************************************)
-C1_ReceiveWithAggregation ==
-  \E chunk \in ActionChunk :
-    /\ did_execute' = FALSE
-    /\ did_produce' = FALSE
-    /\ IF Len(chunk) = 0
-         THEN
-           /\ UNCHANGED << action_queue, action_chunk_size, must_go_event >>
-         ELSE IF MaxChunkTimestep(chunk) <= latest_action_timestep
-           THEN
-             /\ UNCHANGED << action_queue, action_chunk_size, must_go_event >>
-           ELSE
-             LET new_chunk_size == MaxInt(action_chunk_size, Len(chunk)) IN
-             LET k == ScheduleMaxFactor * new_chunk_size IN
-             \E merged \in PossibleMergedQueues(action_queue, chunk, latest_action_timestep) :
-               LET trimmed == TrimQueue(merged, latest_action_timestep, k) IN
-               /\ action_chunk_size' = new_chunk_size
-               /\ action_queue' = trimmed
-               /\ must_go_event' = TRUE
-               /\ Assert(\A t \in Timestep : t <= latest_action_timestep => trimmed[t] = NoAction,
-                         "C1 produced queue with past timesteps")
-    /\ UNCHANGED <<latest_action_timestep, obs_slot, last_processed_obs, predicted_obs_timesteps>>
+C1_DeliverGetActionsResponse ==
+  /\ getactions_waiting
+  /\ action_response_inflight # None
+  /\ LET resp == action_response_inflight IN
+     /\ getactions_waiting' = FALSE
+     /\ action_response_inflight' = None
+     /\ IF resp.isEmpty
+          THEN
+            /\ did_execute' = FALSE
+            /\ did_produce' = FALSE
+            /\ did_send_obs' = FALSE
+            /\ UNCHANGED << action_queue, action_chunk_size, must_go_event >>
+          ELSE
+            LET chunk == resp.chunk IN
+            LET new_chunk_size == MaxInt(action_chunk_size, Len(chunk)) IN
+            LET merged == MergeChunk(action_queue, chunk, latest_action_timestep) IN
+            LET k == ScheduleMaxFactor * new_chunk_size IN
+            LET trimmed == TrimQueue(merged, latest_action_timestep, k) IN
+              /\ action_chunk_size' = new_chunk_size
+              /\ action_queue' = trimmed
+              /\ must_go_event' = TRUE  \* must_go.set() after receiving non-empty actions
+              /\ did_execute' = FALSE
+              /\ did_produce' = FALSE
+              /\ did_send_obs' = FALSE
+              /\ Assert(\A t \in Timestep : t <= latest_action_timestep => trimmed[t] = NoAction,
+                        "C1 produced queue with past timesteps")
+     /\ UNCHANGED <<latest_action_timestep, obs_inflight, obs_slot, last_processed_obs, predicted_obs_timesteps>>
 
 (***************************************************************************
 C2_ExecuteNextAction: Control loop pops and executes one action.
@@ -296,7 +326,17 @@ C2_ExecuteNextAction ==
      /\ action_queue' = [action_queue EXCEPT ![t] = NoAction]
      /\ did_execute' = TRUE
      /\ did_produce' = FALSE
-     /\ UNCHANGED <<action_chunk_size, must_go_event, obs_slot, last_processed_obs, predicted_obs_timesteps>>
+     /\ did_send_obs' = FALSE
+     /\ UNCHANGED <<
+          action_chunk_size,
+          must_go_event,
+          obs_inflight,
+          getactions_waiting,
+          action_response_inflight,
+          obs_slot,
+          last_processed_obs,
+          predicted_obs_timesteps
+        >>
 
 (***************************************************************************
 C3_SendObservation: Client sends observation to server.
@@ -316,82 +356,122 @@ may be dropped during network delivery.
 C3_SendObservation ==
   /\ action_chunk_size > 0
   /\ QueueLen(action_queue) * ChunkSizeThresholdDen <= ChunkSizeThresholdNum * action_chunk_size
+  /\ Cardinality(obs_inflight) < MaxInFlightObs
   /\ LET sendT == IF latest_action_timestep < 0 THEN 0 ELSE latest_action_timestep IN
      \E payload \in Payloads :
        LET sendMustGo == must_go_event /\ QueueLen(action_queue) = 0 IN
        LET obs == [timestep |-> sendT, payload |-> payload, must_go |-> sendMustGo] IN
        /\ must_go_event' = IF sendMustGo THEN FALSE ELSE must_go_event  \* must_go.clear() if sent
-       /\ \/ \* Success case: observation delivered
-             /\ obs_slot' =
-                  IF obs.must_go
-                    THEN obs
-                    ELSE IF ShouldProcess(obs, predicted_obs_timesteps)
-                      THEN obs
-                      ELSE obs_slot
-          \/ \* Network failure case: observation dropped (only when enabled)
+       /\ \/ \* Success case: observation enters the network (in-flight)
+             /\ obs_inflight' = obs_inflight \cup {obs}
+          \/ \* Network failure case: observation dropped before entering network
              /\ EnableNetworkFailures
-             /\ obs_slot' = obs_slot
+             /\ obs_inflight' = obs_inflight
+       /\ did_send_obs' = TRUE
        /\ did_execute' = FALSE
        /\ did_produce' = FALSE
        /\ Assert(~obs.must_go \/ QueueLen(action_queue) = 0,
                 "must_go sent when queue was non-empty")
-       /\ UNCHANGED <<latest_action_timestep, action_queue, action_chunk_size, last_processed_obs, predicted_obs_timesteps>>
+       /\ UNCHANGED <<
+            latest_action_timestep,
+            action_queue,
+            action_chunk_size,
+            getactions_waiting,
+            action_response_inflight,
+            obs_slot,
+            last_processed_obs,
+            predicted_obs_timesteps
+          >>
 
 (***************************************************************************
 Server actions
 ***************************************************************************)
 
 (***************************************************************************
-S1_ProduceActionsForLatestObs: Server processes observation and produces chunk.
+S0_DeliverObservationToServer: a delivered observation is handled by SendObservations.
 
-Network failure modeling: When EnableNetworkFailures is TRUE, the produced
-action chunk may be dropped during network delivery (client never receives it).
-
-In the old implementation, the chunk goes directly to the receiver thread which
-then merges it. We model this as the chunk being available for C1_ReceiveAndMergeChunk.
+This models the server-side behavior of receiving a TimedObservation over the
+network and then either enqueueing it (keep-latest queue size 1) or filtering
+it out (not enqueued).
 ***************************************************************************)
-S1_ProduceActionsForLatestObs ==
-  /\ obs_slot # None
-  /\ LET obs == obs_slot IN
-     LET maxLen == MinInt(ActionsPerChunk, MaxTimestep - obs.timestep + 1) IN
-     /\ maxLen >= 1
-     /\ \E chunk \in ActionChunk :
-          /\ Len(chunk) = maxLen
-          /\ \A i \in 1..Len(chunk) : chunk[i].timestep = obs.timestep + (i - 1)
-          \* In old implementation, chunk is returned to client which then merges
-          \* This is modeled by making the chunk available for C1 to pick up
-          \* For simplicity, we model immediate delivery by merging here
-          /\ LET new_chunk_size == MaxInt(action_chunk_size, Len(chunk)) IN
-             LET merged == MergeChunk(action_queue, chunk, latest_action_timestep) IN
-             LET k == ScheduleMaxFactor * new_chunk_size IN
-             LET trimmed == TrimQueue(merged, latest_action_timestep, k) IN
-             \/ \* Success case: chunk delivered and merged
-                /\ action_queue' = trimmed
-                /\ action_chunk_size' = new_chunk_size
-                /\ must_go_event' = TRUE  \* Re-arm must_go after receiving
-             \/ \* Network failure case: chunk dropped (only when enabled)
-                /\ EnableNetworkFailures
-                /\ UNCHANGED <<action_queue, action_chunk_size, must_go_event>>
-     /\ obs_slot' = None
-     /\ last_processed_obs' = obs
-     /\ predicted_obs_timesteps' = predicted_obs_timesteps \cup {obs.timestep}
-     /\ did_execute' = FALSE
-     /\ did_produce' = TRUE
-     /\ UNCHANGED <<latest_action_timestep>>
+S0_DeliverObservationToServer ==
+  /\ obs_inflight # {}
+  /\ \E obs \in obs_inflight :
+      LET shouldEnqueue ==
+            obs.must_go
+            \/ last_processed_obs = None
+            \/ ShouldProcess(obs, predicted_obs_timesteps)
+      IN
+        /\ obs_inflight' = obs_inflight \ {obs}
+        /\ obs_slot' =
+            IF shouldEnqueue
+              THEN obs  \* keep-latest overwrite semantics (Queue(maxsize=1))
+              ELSE obs_slot
+        /\ did_send_obs' = FALSE
+        /\ did_execute' = FALSE
+        /\ did_produce' = FALSE
+        /\ UNCHANGED <<
+            latest_action_timestep,
+            action_queue,
+            action_chunk_size,
+            must_go_event,
+            getactions_waiting,
+            action_response_inflight,
+            last_processed_obs,
+            predicted_obs_timesteps
+          >>
 
 (***************************************************************************
-S1_Timeout: Server times out waiting for observation.
+S1_HandleGetActions: server handles an in-progress GetActions call.
 
-This models the obs_queue_timeout in the Python implementation.
-When the server times out, it returns empty actions to the client.
+If an observation is available in the server's keep-latest slot, the server
+consumes it and produces a non-empty ActionResponse (chunk).
+If no observation is available and EnableServerTimeout is TRUE, the server
+produces an empty ActionResponse.
 ***************************************************************************)
-S1_Timeout ==
-  /\ EnableServerTimeout
-  /\ obs_slot = None  \* No observation available
-  \* Server returns empty response - this is a no-op for the client
-  /\ did_execute' = FALSE
-  /\ did_produce' = FALSE
-  /\ UNCHANGED <<latest_action_timestep, action_queue, action_chunk_size, must_go_event, obs_slot, last_processed_obs, predicted_obs_timesteps>>
+S1_HandleGetActions ==
+  /\ getactions_waiting
+  /\ action_response_inflight = None
+  /\ IF obs_slot # None
+       THEN
+         LET obs == obs_slot IN
+         LET maxLen == MinInt(ActionsPerChunk, MaxTimestep - obs.timestep + 1) IN
+           /\ maxLen >= 1
+           /\ \E chunk \in ActionChunk :
+                /\ Len(chunk) = maxLen
+                /\ \A i \in 1..Len(chunk) : chunk[i].timestep = obs.timestep + (i - 1)
+                /\ action_response_inflight' = [isEmpty |-> FALSE, chunk |-> chunk]
+                /\ obs_slot' = None
+                /\ last_processed_obs' = obs
+                /\ predicted_obs_timesteps' = predicted_obs_timesteps \cup {obs.timestep}
+                /\ did_produce' = TRUE
+                /\ did_execute' = FALSE
+                /\ did_send_obs' = FALSE
+                /\ UNCHANGED <<
+                    latest_action_timestep,
+                    action_queue,
+                    action_chunk_size,
+                    must_go_event,
+                    obs_inflight,
+                    getactions_waiting
+                  >>
+       ELSE
+         /\ EnableServerTimeout
+         /\ action_response_inflight' = [isEmpty |-> TRUE, chunk |-> << >>]
+         /\ did_produce' = FALSE
+         /\ did_execute' = FALSE
+         /\ did_send_obs' = FALSE
+         /\ UNCHANGED <<
+              latest_action_timestep,
+              action_queue,
+              action_chunk_size,
+              must_go_event,
+              obs_inflight,
+              getactions_waiting,
+              obs_slot,
+              last_processed_obs,
+              predicted_obs_timesteps
+            >>
 
 (***************************************************************************
 S1_EnqueueRace: Models the server's race condition in _enqueue_observation.
@@ -413,9 +493,20 @@ S1_EnqueueRace ==
   \* Race: observation consumed between full() check and get_nowait()
   \* The incoming observation is lost
   /\ obs_slot' = None  \* Lost due to race
+  /\ did_send_obs' = FALSE
   /\ did_execute' = FALSE
   /\ did_produce' = FALSE
-  /\ UNCHANGED <<latest_action_timestep, action_queue, action_chunk_size, must_go_event, last_processed_obs, predicted_obs_timesteps>>
+  /\ UNCHANGED <<
+        latest_action_timestep,
+        action_queue,
+        action_chunk_size,
+        must_go_event,
+        obs_inflight,
+        getactions_waiting,
+        action_response_inflight,
+        last_processed_obs,
+        predicted_obs_timesteps
+      >>
 
 (***************************************************************************
 Next-state relation + fairness
@@ -423,35 +514,41 @@ Next-state relation + fairness
 
 \* Standard Next relation using Replace semantics for merging
 Next ==
-  C1_ReceiveAndMergeChunk \/
+  C0_PollGetActions \/
+  C1_DeliverGetActionsResponse \/
   C2_ExecuteNextAction \/
   C3_SendObservation \/
-  S1_ProduceActionsForLatestObs \/
-  S1_Timeout \/
+  S0_DeliverObservationToServer \/
+  S1_HandleGetActions \/
   S1_EnqueueRace
 
 \* Alternative Next relation using abstract aggregation for merging
 \* WARNING: This is significantly more expensive for TLC due to non-determinism
 NextWithAggregation ==
-  C1_ReceiveWithAggregation \/
+  C0_PollGetActions \/
+  C1_DeliverGetActionsResponse \/
   C2_ExecuteNextAction \/
   C3_SendObservation \/
-  S1_ProduceActionsForLatestObs \/
-  S1_Timeout \/
+  S0_DeliverObservationToServer \/
+  S1_HandleGetActions \/
   S1_EnqueueRace
 
 Fairness ==
-  /\ WF_vars(C1_ReceiveAndMergeChunk)
+  /\ WF_vars(C0_PollGetActions)
+  /\ WF_vars(C1_DeliverGetActionsResponse)
   /\ WF_vars(C2_ExecuteNextAction)
   /\ WF_vars(C3_SendObservation)
-  /\ WF_vars(S1_ProduceActionsForLatestObs)
-  \* Note: S1_Timeout and S1_EnqueueRace do not have fairness - they're failure cases
+  /\ WF_vars(S0_DeliverObservationToServer)
+  /\ WF_vars(S1_HandleGetActions)
+  \* Note: S1_EnqueueRace does not have fairness - it's a failure case
 
 FairnessWithAggregation ==
-  /\ WF_vars(C1_ReceiveWithAggregation)
+  /\ WF_vars(C0_PollGetActions)
+  /\ WF_vars(C1_DeliverGetActionsResponse)
   /\ WF_vars(C2_ExecuteNextAction)
   /\ WF_vars(C3_SendObservation)
-  /\ WF_vars(S1_ProduceActionsForLatestObs)
+  /\ WF_vars(S0_DeliverObservationToServer)
+  /\ WF_vars(S1_HandleGetActions)
 
 \* Standard specification (Replace semantics, may include network failures/timeouts/races)
 Spec == Init /\ [][Next]_vars /\ Fairness
@@ -491,6 +588,16 @@ Live_MustGoObsEventuallyProducesChunk ==
   []((obs_slot # None /\ obs_slot.must_go) => <> (did_produce = TRUE))
 
 (***************************************************************************
+Additional liveness: if the client continues sending observations forever
+(i.e. the control loop keeps running), then it should execute actions forever.
+
+This is intended to surface "stall" traces where the system keeps polling and
+sending observations but never executes any action.
+***************************************************************************)
+Live_IfObsContinuesEventuallyExec ==
+  ([]<>(did_send_obs = TRUE)) => ([]<>(did_execute = TRUE))
+
+(***************************************************************************
 Additional properties
 ***************************************************************************)
 
@@ -498,6 +605,8 @@ Additional properties
 Inv_NotDeadlocked ==
   \/ QueueLen(action_queue) > 0
   \/ obs_slot # None
-  \/ must_go_event  \* Can still send must_go to make progress
+  \/ obs_inflight # {}                 \* Observation is in flight
+  \/ action_response_inflight # None   \* Response is in flight
+  \/ must_go_event                     \* Can still send must_go to make progress
 
 ====
