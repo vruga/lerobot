@@ -50,9 +50,10 @@ import pickle  # nosec
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import asdict
 from pprint import pformat
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from typing import Any
 
 import draccus
@@ -183,8 +184,6 @@ class _ActionSchedule:
             return self._items.pop(t)
 
         return None
-
-
 class RobotClientAlternative:
     prefix = "robot_client_alternative"
     logger = get_logger(prefix)
@@ -225,7 +224,9 @@ class RobotClientAlternative:
         self.action_queue_size: list[int] = []
 
         # Receiver -> control-loop message passing
-        self._incoming_action_chunks: Queue[list[TimedAction]] = Queue()
+        # Bounded queue to prevent backpressure when the control loop slows down.
+        # Overflow policy: drop oldest chunks and keep the newest (best responsiveness).
+        self._incoming_action_chunks: Queue[list[TimedAction]] = Queue(maxsize=10)
 
         # Keep the same synchronized start behavior as the reference implementation
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
@@ -323,6 +324,14 @@ class RobotClientAlternative:
         while True:
             try:
                 chunk = self._incoming_action_chunks.get_nowait()
+
+                # Quick staleness check to avoid trying to merge fully stale chunks.
+                # IMPORTANT: compare timestep (int) against latest_action (int), not timestamp (float seconds).
+                if not chunk:
+                    continue
+                chunk_max_timestep = max(a.get_timestep() for a in chunk)
+                if chunk_max_timestep <= self.latest_action:
+                    continue
             except Empty:
                 break
 
@@ -366,7 +375,15 @@ class RobotClientAlternative:
                     continue
 
                 # Only message-passing here (no shared state mutation).
-                self._incoming_action_chunks.put(timed_actions)
+                # Keep-latest bounding: if the queue is full, drop the oldest chunk and enqueue the newest.
+                try:
+                    self._incoming_action_chunks.put_nowait(timed_actions)
+                except Full:
+                    with suppress(Empty):
+                        _ = self._incoming_action_chunks.get_nowait()
+                    # If still full (rare), drop this newest chunk.
+                    with suppress(Full):
+                        self._incoming_action_chunks.put_nowait(timed_actions)
 
             except grpc.RpcError as e:
                 self.logger.error(f"Error receiving actions: {e}")
