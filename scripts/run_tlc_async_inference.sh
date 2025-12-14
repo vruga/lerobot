@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Usage: ./scripts/run_tlc_async_inference.sh [config]
+#
+# Available configs:
+#   default          - Standard spec with atomic delivery (default)
+#   network-failures - Test safety properties under network failures
+#   aggregation      - Test with abstract aggregation (expensive!)
+#
+# Examples:
+#   ./scripts/run_tlc_async_inference.sh
+#   ./scripts/run_tlc_async_inference.sh network-failures
+#   ./scripts/run_tlc_async_inference.sh aggregation
+
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "${REPO_ROOT}" ]]; then
   echo "error: must be run inside a git checkout (to locate repo root)" >&2
@@ -9,7 +21,26 @@ fi
 
 SPEC_DIR="${REPO_ROOT}/src/lerobot/async_inference/tla"
 TLA_FILE="${SPEC_DIR}/AsyncInference.tla"
-CFG_FILE="${SPEC_DIR}/AsyncInference.cfg"
+
+# Select config based on argument
+CONFIG_NAME="${1:-default}"
+case "${CONFIG_NAME}" in
+  default)
+    CFG_FILE="${SPEC_DIR}/AsyncInference.cfg"
+    ;;
+  network-failures|network_failures|failures)
+    CFG_FILE="${SPEC_DIR}/AsyncInference_NetworkFailures.cfg"
+    ;;
+  aggregation|agg)
+    CFG_FILE="${SPEC_DIR}/AsyncInference_Aggregation.cfg"
+    echo "WARNING: Aggregation config uses non-determinism and is expensive!"
+    ;;
+  *)
+    echo "error: unknown config '${CONFIG_NAME}'" >&2
+    echo "Available: default, network-failures, aggregation" >&2
+    exit 1
+    ;;
+esac
 
 if [[ ! -f "${TLA_FILE}" ]]; then
   echo "error: missing ${TLA_FILE}" >&2
@@ -19,6 +50,8 @@ if [[ ! -f "${CFG_FILE}" ]]; then
   echo "error: missing ${CFG_FILE}" >&2
   exit 1
 fi
+
+echo "Using config: ${CFG_FILE}"
 
 # Allow user override.
 if [[ -n "${TLA_TOOLS_JAR:-}" ]]; then
