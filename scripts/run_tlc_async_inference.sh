@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./scripts/run_tlc_async_inference.sh [config]
+# Usage: ./scripts/run_tlc_async_inference.sh [--old] [config]
+#
+# Flags:
+#   --old            - Run the old implementation spec (OldAsyncInference.tla)
 #
 # Available configs:
 #   default          - Standard spec with atomic delivery (default)
@@ -12,6 +15,8 @@ set -euo pipefail
 #   ./scripts/run_tlc_async_inference.sh
 #   ./scripts/run_tlc_async_inference.sh network-failures
 #   ./scripts/run_tlc_async_inference.sh aggregation
+#   ./scripts/run_tlc_async_inference.sh --old
+#   ./scripts/run_tlc_async_inference.sh --old default
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "${REPO_ROOT}" ]]; then
@@ -20,19 +25,35 @@ if [[ -z "${REPO_ROOT}" ]]; then
 fi
 
 SPEC_DIR="${REPO_ROOT}/src/lerobot/async_inference/tla"
-TLA_FILE="${SPEC_DIR}/AsyncInference.tla"
+
+# Parse --old flag
+USE_OLD_SPEC=false
+if [[ "${1:-}" == "--old" ]]; then
+  USE_OLD_SPEC=true
+  shift
+fi
+
+# Select TLA file based on --old flag
+if [[ "${USE_OLD_SPEC}" == "true" ]]; then
+  TLA_FILE="${SPEC_DIR}/OldAsyncInference.tla"
+  SPEC_PREFIX="OldAsyncInference"
+  echo "Using OLD implementation spec: OldAsyncInference.tla"
+else
+  TLA_FILE="${SPEC_DIR}/AsyncInference.tla"
+  SPEC_PREFIX="AsyncInference"
+fi
 
 # Select config based on argument
 CONFIG_NAME="${1:-default}"
 case "${CONFIG_NAME}" in
   default)
-    CFG_FILE="${SPEC_DIR}/AsyncInference.cfg"
+    CFG_FILE="${SPEC_DIR}/${SPEC_PREFIX}.cfg"
     ;;
   network-failures|network_failures|failures)
-    CFG_FILE="${SPEC_DIR}/AsyncInference_NetworkFailures.cfg"
+    CFG_FILE="${SPEC_DIR}/${SPEC_PREFIX}_NetworkFailures.cfg"
     ;;
   aggregation|agg)
-    CFG_FILE="${SPEC_DIR}/AsyncInference_Aggregation.cfg"
+    CFG_FILE="${SPEC_DIR}/${SPEC_PREFIX}_Aggregation.cfg"
     echo "WARNING: Aggregation config uses non-determinism and is expensive!"
     ;;
   *)
