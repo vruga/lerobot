@@ -34,7 +34,7 @@ A SortedDict keyed on logical timestamp would probably be a better data structur
 ## Alternative Client State Machine
 Does not include GRPC handshaking for simplicity and so we can focus on the core logic.
 
-### Alternative Client -Control Loop Process
+### Alternative Client 
 - main thread: starts the control loop
     - merge incoming actions into action schedule (in first tick we expect there to be no actions yet)
         - calls get on the _incoming_action_chunks queue to get the next action chunk
@@ -43,9 +43,7 @@ Does not include GRPC handshaking for simplicity and so we can focus on the core
     - get observation from robot with get_observation
     - send observation to policy server with send_observation
 - background thread: starts the action receiving loop
-    - calls GetActions and writes using `put` to _incoming_action_chunks queue. Acts as a staging area for action chunks. The _incoming_action_chunks queue items are List[TimedAction].
-
-### Alternative Client - Action Receiving Process
+    - calls GetActions and writes using `put` to _incoming_action_chunks queue. Acts as a staging area for action chunks. The _incoming_action_chunks queue items are List[TimedAction]. This is a bounded queue to prevent backpressure when the control loop slows down. Overflow policy: drop oldest chunks and keep the newest.
 
 
 ## Resources
